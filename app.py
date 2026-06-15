@@ -741,6 +741,11 @@ def init_session_state():
         "memory_count": 0,             # 当前记忆总数
         "user_api_key": "",            # 用户在界面输入的 API Key
         "last_proactive_time": {},     # 主动提问冷却记录 {"time_gap": timestamp, "keyword_stress": timestamp}
+        # —— 头像与昵称设置 ——
+        "user_avatar": "👤",           # 用户头像（emoji 或图片 URL）
+        "ai_avatar": "🌱",             # AI 头像（emoji 或图片 URL）
+        "user_name": "我",             # 用户显示名称
+        "ai_name": "禾苗",             # AI 显示名称
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -995,6 +1000,60 @@ def render_sidebar():
 
         st.markdown("---")
 
+        # —— 头像与昵称设置 ——
+        with st.expander("个性化设置"):
+            # 预设头像库
+            AVATAR_PRESETS = {
+                "用户": ["👤", "🧑", "👩", "👨", "😊", "🐱", "🐶", "🦊", "🐼", "⭐"],
+                "AI":   ["🌱", "🤖", "✨", "🌟", "💡", "🌸", "🍀", "🎵", "💎", "🔥"],
+            }
+
+            st.caption("用户头像")
+            col_user_avatars = st.columns(5)
+            for i, emoji in enumerate(AVATAR_PRESETS["用户"]):
+                with col_user_avatars[i % 5]:
+                    if st.button(emoji, key=f"ua_{emoji}", use_container_width=True,
+                                 help=f"选择 {emoji} 作为你的头像"):
+                        st.session_state.user_avatar = emoji
+                        st.rerun()
+
+            st.caption("AI 头像")
+            col_ai_avatars = st.columns(5)
+            for i, emoji in enumerate(AVATAR_PRESETS["AI"]):
+                with col_ai_avatars[i % 5]:
+                    if st.button(emoji, key=f"aa_{emoji}", use_container_width=True,
+                                 help=f"选择 {emoji} 作为 AI 头像"):
+                        st.session_state.ai_avatar = emoji
+                        st.rerun()
+
+            # 自定义昵称
+            col_name1, col_name2 = st.columns(2)
+            with col_name1:
+                new_user_name = st.text_input(
+                    "你的昵称", value=st.session_state.user_name,
+                    placeholder="我", max_chars=10
+                )
+                if new_user_name and new_user_name != st.session_state.user_name:
+                    st.session_state.user_name = new_user_name
+                    st.rerun()
+            with col_name2:
+                new_ai_name = st.text_input(
+                    "AI 昵称", value=st.session_state.ai_name,
+                    placeholder="禾苗", max_chars=10
+                )
+                if new_ai_name and new_ai_name != st.session_state.ai_name:
+                    st.session_state.ai_name = new_ai_name
+                    st.rerun()
+
+            # 当前预览
+            st.caption(
+                f"预览：{st.session_state.user_avatar} {st.session_state.user_name}"
+                f"  ⇄  "
+                f"{st.session_state.ai_avatar} {st.session_state.ai_name}"
+            )
+
+        st.markdown("---")
+
         # —— 记忆可视化面板（调用独立模块） ——
         render_memory_panel()
 
@@ -1135,9 +1194,16 @@ def render_main():
             "content": welcome_msg,
         })
 
-    # —— 渲染对话历史 ——
+    # —— 渲染对话历史（使用用户设定的头像和昵称） ——
     for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
+        # 根据角色选择头像
+        if msg["role"] == "user":
+            avatar = st.session_state.user_avatar
+            label = st.session_state.user_name
+        else:
+            avatar = st.session_state.ai_avatar
+            label = st.session_state.ai_name
+        with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"])
 
     # —— 输入区域 ——
@@ -1154,11 +1220,11 @@ def render_main():
         # 添加用户消息
         st.session_state.messages.append({"role": "user", "content": user_input})
 
-        with st.chat_message("user"):
+        with st.chat_message("user", avatar=st.session_state.user_avatar):
             st.markdown(user_input)
 
         # 生成 AI 回复
-        with st.chat_message("assistant"):
+        with st.chat_message("assistant", avatar=st.session_state.ai_avatar):
             with st.spinner(""):
                 reply = process_user_message(user_input, llm)
 
