@@ -174,9 +174,14 @@ def get_llm(api_key: str) -> ChatOpenAI:
 def get_api_key() -> str | None:
     """
     获取 DeepSeek API Key。
-    优先级: Streamlit Secrets > 环境变量(.env)
+    优先级: 用户界面输入 > Streamlit Secrets > 环境变量(.env)
     """
-    # 优先 Streamlit Cloud Secrets
+    # 优先使用用户在界面中输入的 Key
+    user_key = st.session_state.get("user_api_key", "").strip()
+    if user_key:
+        return user_key
+
+    # 其次 Streamlit Cloud Secrets
     try:
         key = st.secrets.get("DEEPSEEK_API_KEY", "")
         if key:
@@ -184,7 +189,7 @@ def get_api_key() -> str | None:
     except (KeyError, FileNotFoundError):
         pass
 
-    # 其次环境变量
+    # 再次环境变量
     env_key = os.getenv("DEEPSEEK_API_KEY", "")
     if env_key:
         return env_key
@@ -609,7 +614,7 @@ def build_system_prompt(
         完整的系统提示词
     """
     prompt_parts = [
-        "你是一位善解人意、温和体贴的AI伴侣。你的名字是「灵犀」。",
+        "你是一位善解人意、温和体贴的AI伴侣。你的名字是「禾苗」。",
         "",
         "## 核心原则",
         "- 你是用户值得信赖的朋友，而非冷冰冰的工具。",
@@ -659,6 +664,7 @@ def init_session_state():
         "emotion_history": [],         # 情绪记录 [{"time": str, "polarity": str, "score": float}, ...]
         "api_key_verified": False,     # API Key 是否已验证
         "memory_count": 0,             # 当前记忆总数
+        "user_api_key": "",            # 用户在界面输入的 API Key
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -783,37 +789,68 @@ def render_sidebar():
 
     with st.sidebar:
         # —— 品牌标识 —— 使用原生组件，避免 DOM 冲突
-        st.title("灵 犀")
+        st.title("禾 苗")
         st.caption("AI Companion")
 
         st.markdown("---")
 
-        # —— API Key 状态 ——
-        api_key = get_api_key()
-        if api_key and st.session_state.api_key_verified:
+        # —— API Key 配置 ——
+        st.markdown("### API 配置")
+
+        # 检测是否已有 Secrets 中的 Key
+        has_secret_key = False
+        try:
+            has_secret_key = bool(st.secrets.get("DEEPSEEK_API_KEY", ""))
+        except (KeyError, FileNotFoundError):
+            pass
+
+        if has_secret_key:
+            st.success("已使用云端配置的 API Key")
+        elif st.session_state.get("user_api_key", "") and st.session_state.api_key_verified:
             st.success("API 已连接")
-        elif api_key and not st.session_state.api_key_verified:
-            with st.spinner("验证 API Key..."):
-                if verify_api_key(api_key):
-                    st.session_state.api_key_verified = True
-                    st.success("API 已连接")
-                    st.rerun()
-                else:
-                    st.error("API Key 无效")
         else:
-            st.warning("未配置 API Key")
-            with st.expander("配置方式"):
+            with st.form("api_key_form", clear_on_submit=False):
+                user_key_input = st.text_input(
+                    "DeepSeek API Key",
+                    type="password",
+                    value=st.session_state.get("user_api_key", ""),
+                    placeholder="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                    help="输入后点击「保存」即可使用。Key 仅保存在当前会话中。",
+                )
+                col_save, col_clear = st.columns(2)
+                with col_save:
+                    save_clicked = st.form_submit_button("保存", use_container_width=True, type="primary")
+                with col_clear:
+                    clear_clicked = st.form_submit_button("清除", use_container_width=True)
+
+            if save_clicked and user_key_input.strip():
+                st.session_state.user_api_key = user_key_input.strip()
+                st.session_state.api_key_verified = False  # 触发重新验证
+                st.rerun()
+
+            if clear_clicked:
+                st.session_state.user_api_key = ""
+                st.session_state.api_key_verified = False
+                st.rerun()
+
+            # 验证用户输入的 Key
+            if st.session_state.get("user_api_key", "") and not st.session_state.api_key_verified:
+                with st.spinner("正在验证 API Key..."):
+                    if verify_api_key(st.session_state.user_api_key):
+                        st.session_state.api_key_verified = True
+                        st.rerun()
+                    else:
+                        st.error("API Key 无效，请检查")
+
+            with st.expander("如何获取 API Key？"):
                 st.markdown("""
-                **方式一（本地）**：在项目根目录创建 `.env` 文件：
-                ```
-                DEEPSEEK_API_KEY=sk-xxxxx
-                ```
+                1. 访问 [platform.deepseek.com](https://platform.deepseek.com)
+                2. 注册 / 登录账号
+                3. 进入 **API Keys** 页面
+                4. 点击「创建 API Key」并复制
+                5. 粘贴到上方输入框，点击「保存」
 
-                **方式二（云端）**：在 Streamlit Cloud 的 Secrets 中设置
-                `DEEPSEEK_API_KEY`。
-
-                > 前往 [platform.deepseek.com](https://platform.deepseek.com)
-                > 注册并获取 API Key。
+                > 新用户通常有免费额度
                 """)
 
         st.markdown("---")
@@ -912,9 +949,9 @@ def render_sidebar():
         st.markdown("---")
 
         # —— 关于 ——
-        with st.expander("关于灵犀"):
+        with st.expander("关于禾苗"):
             st.markdown("""
-            **灵犀 AI 伴侣** v1.0
+            **禾苗 AI 伴侣** v1.0
 
             核心能力：
             - 长期记忆存储与检索
@@ -935,7 +972,7 @@ def render_main():
     """渲染主对话区域"""
 
     # —— 标题 —— 使用原生组件
-    st.title("灵 犀")
+    st.title("禾 苗")
     st.caption("你的 AI 伴侣")
 
     # —— 首次使用提示 ——
@@ -966,10 +1003,10 @@ def render_main():
                 days = int(hours_since / 24)
                 welcome_msg = f"欢迎回来！已经 {days} 天没见了，最近过得怎么样？有什么想聊的或者需要我帮忙的吗？"
             else:
-                welcome_msg = "你好！我是灵犀，你的AI伴侣。你可以和我聊天、让我记住关于你的事，我会越来越了解你。"
+                welcome_msg = "你好！我是禾苗，你的AI伴侣。你可以和我聊天、让我记住关于你的事，我会越来越了解你。"
         else:
             welcome_msg = (
-                "你好，我是**灵犀**，你的 AI 伴侣。\n\n"
+                "你好，我是**禾苗**，你的 AI 伴侣。\n\n"
                 "我可以：\n"
                 "- 记住关于你的一切（试试说「记住：我喜欢吃辣」）\n"
                 "- 感知你的情绪并调整回应方式\n"
@@ -1027,4 +1064,4 @@ if __name__ == "__main__":
 
     # 页脚
     st.divider()
-    st.caption("LingXi AI Companion · Powered by Streamlit + LangChain + ChromaDB + DeepSeek")
+    st.caption("HeMiao AI Companion · Powered by Streamlit + LangChain + ChromaDB + DeepSeek")
