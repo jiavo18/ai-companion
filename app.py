@@ -101,6 +101,9 @@ CONCERN_PATTERNS = {
 MEMORY_FORGET_DAYS = 30
 MEMORY_WEAKEN_DAYS = 14
 
+# —— 主动提问冷却时间（秒） —— 同一触发条件 1 小时内不重复
+PROACTIVE_COOLDOWN_SECONDS = 3600
+
 # —— 持久化路径 ——
 CHROMA_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
 LAST_ACTIVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_active.json")
@@ -526,8 +529,43 @@ def parse_feedback_to_constraints(feedbacks: list[str]) -> str:
     return "\n".join(f"- {c}" for c in unique_constraints)
 
 # ============================================================================
-# 主动关心模块
+# 主动提问模块（升级版）
+#   触发条件：
+#     1. 超过 24 小时未对话 → 时间间隔触发
+#     2. 最近 3 轮用户消息中连续出现压力关键词 → 关键词连续触发
+#   冷却机制：同一触发类型在 1 小时内不重复
 # ============================================================================
+
+# —— 压力关键词列表（用于连续检测） ——
+STRESS_KEYWORDS = ["累", "加班", "压力", "熬夜", "疲惫", "焦虑", "忙", "烦躁", "崩溃"]
+
+
+def _is_in_cooldown(trigger_type: str) -> bool:
+    """
+    检查指定触发类型是否在冷却期内。
+
+    参数:
+        trigger_type: "time_gap" 或 "keyword_stress"
+
+    返回:
+        True 表示冷却中，不应再次触发
+    """
+    last_time = st.session_state.last_proactive_time.get(trigger_type)
+    if last_time is None:
+        return False
+    elapsed = (datetime.now() - last_time).total_seconds()
+    return elapsed < PROACTIVE_COOLDOWN_SECONDS
+
+
+def _record_trigger(trigger_type: str):
+    """
+    记录触发时间戳，启动冷却。
+
+    参数:
+        trigger_type: "time_gap" 或 "keyword_stress"
+    """
+    st.session_state.last_proactive_time[trigger_type] = datetime.now()
+
 
 def get_last_active_time() -> datetime | None:
     """从本地文件读取上次活跃时间"""
@@ -550,44 +588,81 @@ def update_last_active_time():
         pass
 
 
-def generate_proactive_care(conversation_history: list[dict]) -> str | None:
+def check_trigger_conditions(user_input: str, conversation_history: list[dict]) -> str | None:
     """
-    生成主动关心语句。
+    检测主动提问触发条件，返回关心语句或 None。
+
+    触发条件 1 —— 时间间隔触发：
+        如果用户超过 24 小时未对话，且该类型不在冷却期，
+        生成一句欢迎/关心问候。
+
+    触发条件 2 —— 关键词连续触发：
+        如果用户在过去 3 轮对话中，每条消息都包含压力关键词，
+        且该类型不在冷却期，生成一句放松建议。
 
     参数:
-        conversation_history: 最近的对话历史
+        user_input: 当前用户输入文本
+        conversation_history: 完整对话历史
 
     返回:
-        关心语句文本，若无触发条件则返回 None
+        主动提问文本（将作为 AI 回答的第一句话），无触发则返回 None
     """
-    care_messages = []
+    now = datetime.now()
+    care_parts = []
 
-    # 检查1: 距离上次对话的时间
-    last_active = get_last_active_time()
-    if last_active:
-        hours_since = (datetime.now() - last_active).total_seconds() / 3600
-        if hours_since > 24:
-            days = int(hours_since / 24)
-            care_messages.append(
-                f"已经{days}天没聊了，最近过得怎么样？有什么想和我分享的吗？"
+    # ============================================================
+    # 触发条件 1：超过 24 小时未对话
+    # ============================================================
+    if not _is_in_cooldown("time_gap"):
+        last_active = get_last_active_time()
+        if last_active:
+            hours_since = (now - last_active).total_seconds() / 3600
+            if hours_since > 24:
+                days = int(hours_since / 24)
+                care_parts.append(
+                    f"已经 {days} 天没聊了，最近过得怎么样？有什么想和我分享的吗？"
+                )
+                _record_trigger("time_gap")
+
+    # ============================================================
+    # 触发条件 2：最近 3 轮用户消息连续包含压力关键词
+    # ============================================================
+    if not _is_in_cooldown("keyword_stress"):
+        # 收集最近 3 条用户消息（不含当前）
+        user_messages = [
+            msg.get("content", "")
+            for msg in conversation_history
+            if msg.get("role") == "user"
+        ]
+        # 取最近 2 条 + 当前输入 = 共 3 条
+        recent_user_texts = user_messages[-2:] + [user_input]
+
+        if len(recent_user_texts) >= 3:
+            # 检查每条消息是否至少包含一个压力关键词
+            all_stressed = all(
+                any(kw in text for kw in STRESS_KEYWORDS)
+                for text in recent_user_texts[-3:]
             )
+            if all_stressed:
+                # 找出最后一条消息中匹配到的关键词，生成针对性建议
+                last_text = recent_user_texts[-1]
+                matched = [kw for kw in STRESS_KEYWORDS if kw in last_text]
+                if "加班" in matched or "忙" in matched:
+                    suggestion = "你最近似乎工作很忙，别忘了给自己留一些喘息的时间。"
+                elif "累" in matched or "疲惫" in matched:
+                    suggestion = "感觉你最近挺疲惫的，要不要听听轻音乐放松一下？"
+                elif "熬夜" in matched:
+                    suggestion = "注意到你最近经常熬夜，身体是革命的本钱，记得早点休息。"
+                elif "压力" in matched or "焦虑" in matched or "烦躁" in matched:
+                    suggestion = "你好像压力有点大，深呼吸或者出去走走都会有帮助。"
+                else:
+                    suggestion = "最近辛苦了，要不要给自己放个小假调整一下？"
 
-    # 检查2: 从最近对话中检测压力/疲劳关键词
-    if conversation_history:
-        recent_texts = []
-        for msg in conversation_history[-10:]:  # 最近10条
-            if msg.get("role") == "user":
-                recent_texts.append(msg.get("content", ""))
+                care_parts.append(suggestion)
+                _record_trigger("keyword_stress")
 
-        combined_text = " ".join(recent_texts)
-
-        for keyword, care_msg in CONCERN_PATTERNS.items():
-            if keyword in combined_text:
-                care_messages.append(care_msg)
-                break  # 只取第一个匹配的关心模式
-
-    if care_messages:
-        return " ".join(care_messages)
+    if care_parts:
+        return " ".join(care_parts)
 
     return None
 
@@ -665,6 +740,7 @@ def init_session_state():
         "api_key_verified": False,     # API Key 是否已验证
         "memory_count": 0,             # 当前记忆总数
         "user_api_key": "",            # 用户在界面输入的 API Key
+        "last_proactive_time": {},     # 主动提问冷却记录 {"time_gap": timestamp, "keyword_stress": timestamp}
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -678,14 +754,15 @@ def process_user_message(user_input: str, llm: ChatOpenAI) -> str:
     """
     处理用户输入并生成 AI 回复。
 
-    处理流程:
+    处理流程（按顺序）:
     1. 判断是否为记忆/反馈指令
-    2. 情感检测
-    3. 记忆检索
-    4. 反馈检索
-    5. 主动关心生成
-    6. 构建系统提示词
+    2. 主动提问检测（在 LLM 调用前完成，结果作为回复前缀）
+    3. 情感检测
+    4. 记忆检索
+    5. 反馈检索
+    6. 构建系统提示词（不再包含主动关心，已移至步骤2）
     7. 调用 LLM
+    8. 将主动提问文本拼接为回复的第一句话
     """
     user_input = user_input.strip()
 
@@ -709,7 +786,11 @@ def process_user_message(user_input: str, llm: ChatOpenAI) -> str:
             update_last_active_time()
             return f"已收到你的反馈：「{content}」。我会在后续对话中调整我的表达方式。"
 
-    # —— 步骤1: 情感检测 ——
+    # —— 步骤1: 主动提问检测（在 LLM 调用前完成判断） ——
+    # 返回的 proactive_text 将作为 AI 回复的第一句话
+    proactive_text = check_trigger_conditions(user_input, st.session_state.messages)
+
+    # —— 步骤2: 情感检测 ——
     emotion_result = detect_emotion(user_input)
     emotion_guide = get_emotion_response_guide(emotion_result["polarity"])
 
@@ -723,22 +804,19 @@ def process_user_message(user_input: str, llm: ChatOpenAI) -> str:
     if len(st.session_state.emotion_history) > 100:
         st.session_state.emotion_history = st.session_state.emotion_history[-100:]
 
-    # —— 步骤2: 记忆检索 ——
+    # —— 步骤3: 记忆检索 ——
     memories = retrieve_memories(user_input, n_results=3)
 
-    # —— 步骤3: 反馈检索 ——
+    # —— 步骤4: 反馈检索 ——
     feedbacks = retrieve_feedback(n_results=3)
     feedback_constraints = parse_feedback_to_constraints(feedbacks)
 
-    # —— 步骤4: 主动关心 ——
-    proactive_care = generate_proactive_care(st.session_state.messages)
-
-    # —— 步骤5: 构建系统提示词 ——
+    # —— 步骤5: 构建系统提示词（主动关心已移至步骤1，不再入系统提示） ——
     system_prompt = build_system_prompt(
         memories=memories,
         feedback_constraints=feedback_constraints,
         emotion_guide=emotion_guide,
-        proactive_care=proactive_care,
+        proactive_care=None,  # 不再通过系统提示词注入
     )
 
     # —— 步骤6: 构建消息列表 ——
@@ -758,11 +836,18 @@ def process_user_message(user_input: str, llm: ChatOpenAI) -> str:
     # —— 步骤7: 调用 LLM ——
     try:
         response = llm.invoke(messages)
-        reply = response.content
+        llm_reply = response.content
     except Exception as e:
-        reply = f"抱歉，我暂时无法回应。请检查网络连接或API配置。（错误详情：{str(e)}）"
+        llm_reply = f"抱歉，我暂时无法回应。请检查网络连接或API配置。（错误详情：{str(e)}）"
 
-    # —— 步骤8: 更新活跃时间 ——
+    # —— 步骤8: 拼接回复 ——
+    # 如果触发了主动提问，将其作为回复的第一句话
+    if proactive_text:
+        reply = f"{proactive_text}\n\n{llm_reply}"
+    else:
+        reply = llm_reply
+
+    # —— 步骤9: 更新活跃时间 ——
     update_last_active_time()
 
     return reply
@@ -779,6 +864,61 @@ def verify_api_key(api_key: str) -> bool:
         return bool(response.content.strip())
     except Exception:
         return False
+
+# ============================================================================
+# 记忆可视化面板（独立模块）
+#   位置：侧边栏底部，折叠式面板
+#   内容：向量数据库中存储的用户记忆条目（最多 20 条）
+#   操作：逐条删除 + 清空全部
+# ============================================================================
+
+def render_memory_panel():
+    """
+    渲染记忆可视化面板。
+
+    从 ChromaDB 的 user_memories 集合中读取所有记忆条目，
+    以折叠面板形式展示在侧边栏中。每条记忆显示原文和存储时间，
+    提供单条删除和清空全部按钮。
+    """
+    st.markdown("### 记忆档案")
+
+    # 从 ChromaDB 获取所有记忆（最多 20 条）
+    memories = get_all_memories(limit=20)
+
+    # —— 统计行：记忆数量 + 清空按钮 ——
+    col_count, col_clear = st.columns([2, 1])
+    with col_count:
+        st.metric("已存储记忆", len(memories))
+    with col_clear:
+        if memories:
+            if st.button("清空全部", type="secondary", use_container_width=True):
+                if clear_all_memories():
+                    st.session_state.memory_count = 0
+                    st.rerun()
+
+    # —— 记忆列表（可滚动容器） ——
+    if memories:
+        with st.container(height=320):
+            for mem in memories:
+                # 格式化存储时间
+                created_str = (
+                    mem["created_at"][:16].replace("T", " ")
+                    if mem["created_at"] else "未知"
+                )
+                # 折叠面板：标题显示记忆内容前 40 字
+                with st.expander(f"{mem['content'][:40]}...", expanded=False):
+                    st.caption(f"存储时间：{created_str}")
+                    st.caption(f"访问次数：{mem['access_count']}")
+                    # 单条删除按钮
+                    if st.button("删除此记忆", key=f"del_{mem['id']}", type="secondary"):
+                        if delete_memory(mem["id"]):
+                            st.session_state.memory_count = max(
+                                0, st.session_state.memory_count - 1
+                            )
+                            st.rerun()
+    else:
+        st.caption("暂无记忆。对我说「记住：xxx」来添加记忆。")
+
 
 # ============================================================================
 # 界面渲染 —— 侧边栏
@@ -855,33 +995,8 @@ def render_sidebar():
 
         st.markdown("---")
 
-        # —— 记忆可视化面板 ——
-        st.markdown("### 记忆档案")
-        memories = get_all_memories(limit=20)
-
-        col_count, col_clear = st.columns([2, 1])
-        with col_count:
-            st.metric("已存储记忆", len(memories))
-        with col_clear:
-            if memories:
-                if st.button("清空全部", type="secondary", use_container_width=True):
-                    if clear_all_memories():
-                        st.session_state.memory_count = 0
-                        st.rerun()
-
-        if memories:
-            with st.container(height=320):
-                for mem in memories:
-                    created_str = mem["created_at"][:16].replace("T", " ") if mem["created_at"] else "未知"
-                    with st.expander(f"{mem['content'][:40]}...", expanded=False):
-                        st.caption(f"存储时间：{created_str}")
-                        st.caption(f"访问次数：{mem['access_count']}")
-                        if st.button("删除此记忆", key=f"del_{mem['id']}", type="secondary"):
-                            if delete_memory(mem["id"]):
-                                st.session_state.memory_count = max(0, st.session_state.memory_count - 1)
-                                st.rerun()
-        else:
-            st.caption("暂无记忆。对我说「记住：xxx」来添加记忆。")
+        # —— 记忆可视化面板（调用独立模块） ——
+        render_memory_panel()
 
         st.markdown("---")
 
