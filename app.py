@@ -45,96 +45,19 @@ st.set_page_config(
 )
 
 # ============================================================================
-# 自定义 CSS 样式 —— 高端简约风格
+# 自定义 CSS 样式 —— 仅通过类选择器微调，不触碰 Streamlit 内部 DOM
 # ============================================================================
 st.markdown("""
 <style>
-    /* 全局字体优化 —— 使用系统原生字体确保加载速度 */
+    /* 全局字体 */
     html, body, [class*="css"] {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     }
-
-    /* 主标题 */
-    .main-header {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 0.5rem 0 1.5rem 0;
-        border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-        margin-bottom: 1rem;
-    }
-    .main-header .logo {
-        font-size: 2.2rem;
-        font-weight: 300;
-        letter-spacing: -0.5px;
-        color: #1a1a1a;
-    }
-    .main-header .tagline {
-        font-size: 0.85rem;
-        color: #999;
-        font-weight: 400;
-        letter-spacing: 0.5px;
-        text-transform: uppercase;
-    }
-
-    /* 侧边栏美化 */
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #fafafa 0%, #f5f5f5 100%);
-        border-right: 1px solid rgba(0,0,0,0.06);
-    }
-    [data-testid="stSidebar"] .stMarkdown h3 {
-        font-weight: 500;
-        letter-spacing: 0.3px;
-        color: #333;
-        font-size: 0.95rem;
-        text-transform: uppercase;
-    }
-
-    /* 聊天消息微调 */
-    [data-testid="stChatMessage"] {
-        border-radius: 12px;
-        padding: 1rem 1.2rem;
-    }
-
-    /* 输入框 */
-    textarea[aria-label="输入消息..."] {
-        border-radius: 10px !important;
-        border: 1px solid rgba(0,0,0,0.1) !important;
-        font-size: 0.95rem !important;
-    }
-
-    /* 按钮 */
+    /* 按钮微调 */
     .stButton > button {
         border-radius: 8px;
         font-weight: 500;
-        letter-spacing: 0.3px;
         transition: all 0.2s ease;
-    }
-    .stButton > button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-    }
-
-    /* 系统通知条 */
-    .system-notice {
-        background: linear-gradient(135deg, #f0f4ff 0%, #e8edf8 100%);
-        border-left: 3px solid #5b7fff;
-        padding: 0.8rem 1rem;
-        border-radius: 0 8px 8px 0;
-        font-size: 0.85rem;
-        color: #444;
-        margin: 0.5rem 0;
-    }
-
-    /* 页脚 */
-    .footer {
-        text-align: center;
-        color: #bbb;
-        font-size: 0.72rem;
-        margin-top: 3rem;
-        padding-top: 1rem;
-        border-top: 1px solid rgba(0,0,0,0.05);
-        letter-spacing: 0.5px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -853,15 +776,9 @@ def render_sidebar():
     """渲染侧边栏：API配置 + 记忆面板 + 情绪图表"""
 
     with st.sidebar:
-        # —— 品牌标识 ——
-        st.markdown("""
-        <div style="text-align: center; padding: 1rem 0 0.5rem 0;">
-            <div style="font-size: 2.5rem; font-weight: 200; letter-spacing: 2px; color: #333;">灵 犀</div>
-            <div style="font-size: 0.75rem; color: #aaa; letter-spacing: 1px; text-transform: uppercase; margin-top: 2px;">
-                AI Companion
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        # —— 品牌标识 —— 使用原生组件，避免 DOM 冲突
+        st.title("灵 犀")
+        st.caption("AI Companion")
 
         st.markdown("---")
 
@@ -1011,13 +928,9 @@ def render_sidebar():
 def render_main():
     """渲染主对话区域"""
 
-    # —— 标题 ——
-    st.markdown("""
-    <div class="main-header">
-        <span class="logo">灵犀</span>
-        <span class="tagline">· 你的 AI 伴侣 ·</span>
-    </div>
-    """, unsafe_allow_html=True)
+    # —— 标题 —— 使用原生组件
+    st.title("灵 犀")
+    st.caption("你的 AI 伴侣")
 
     # —— 首次使用提示 ——
     api_key = get_api_key()
@@ -1107,8 +1020,5 @@ if __name__ == "__main__":
     render_main()
 
     # 页脚
-    st.markdown("""
-    <div class="footer">
-        LingXi AI Companion · Powered by Streamlit + LangChain + ChromaDB + DeepSeek
-    </div>
-    """, unsafe_allow_html=True)
+    st.divider()
+    st.caption("LingXi AI Companion · Powered by Streamlit + LangChain + ChromaDB + DeepSeek")
