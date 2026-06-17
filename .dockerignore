@@ -1,0 +1,27 @@
+# 环境变量（含 API Key）
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 运行时数据（每次容器启动时重建）
+chroma_db/
+data/
+last_active.json
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# 其他
+*.md
+.DS_Store
+Thumbs.db
