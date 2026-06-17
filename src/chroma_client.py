@@ -74,30 +74,90 @@ def create_chroma_client(persist_path: str = DEFAULT_CHROMA_DB_PATH):
 # 集合管理
 # ============================================================================
 
-def get_or_create_collections(client, embedding_function):
+def get_or_create_collections(client, embedding_function, user_id: int = 0):
     """
-    获取或创建 ChromaDB 集合。
+    获取或创建 ChromaDB 集合（按 user_id 隔离）。
+
+    每个用户的记忆和反馈存储在独立集合中，确保数据互不可见。
 
     参数:
         client: ChromaDB 客户端实例
         embedding_function: 嵌入函数实例
+        user_id: 用户 ID（0 表示未登录的默认集合）
 
     返回:
         (memory_collection, feedback_collection) 元组
     """
+    memory_name = f"user_memories_{user_id}"
+    feedback_name = f"feedback_collection_{user_id}"
+
     memory_collection = client.get_or_create_collection(
-        name="user_memories",
+        name=memory_name,
         embedding_function=embedding_function,
-        metadata={"description": "用户长期记忆存储"},
+        metadata={"description": f"用户 {user_id} 的长期记忆存储"},
     )
 
     feedback_collection = client.get_or_create_collection(
-        name="feedback_collection",
+        name=feedback_name,
         embedding_function=embedding_function,
-        metadata={"description": "用户反馈与风格偏好"},
+        metadata={"description": f"用户 {user_id} 的反馈与风格偏好"},
     )
 
+    # —— 旧数据迁移：如果存在不带 user_id 后缀的旧集合，自动迁移 ——
+    _migrate_legacy_if_needed(client, embedding_function, user_id)
+
     return memory_collection, feedback_collection
+
+
+def _migrate_legacy_if_needed(client, embedding_function, user_id: int):
+    """
+    检测并迁移旧版（不带 user_id 后缀）的数据。
+
+    如果旧集合 user_memories 存在且用户尚未有迁移标记，
+    将旧数据复制到 user_memories_{user_id}，然后删除旧集合。
+    """
+    if user_id == 0:
+        return  # 未登录用户不需要迁移
+
+    try:
+        legacy_mem = client.get_collection(name="user_memories")
+        legacy_fb = client.get_collection(name="feedback_collection")
+
+        # 检查旧集合是否有数据
+        mem_data = legacy_mem.get(include=["documents", "metadatas"])
+        fb_data = legacy_fb.get(include=["documents", "metadatas"])
+
+        if mem_data["ids"]:
+            # 迁移记忆
+            new_mem = client.get_or_create_collection(
+                name=f"user_memories_{user_id}",
+                embedding_function=embedding_function,
+            )
+            existing_new = new_mem.get(include=[])
+            if not existing_new["ids"]:  # 只在新集合为空时迁移
+                new_mem.add(
+                    ids=mem_data["ids"],
+                    documents=mem_data["documents"],
+                    metadatas=mem_data["metadatas"],
+                )
+            client.delete_collection(name="user_memories")
+
+        if fb_data["ids"]:
+            # 迁移反馈
+            new_fb = client.get_or_create_collection(
+                name=f"feedback_collection_{user_id}",
+                embedding_function=embedding_function,
+            )
+            existing_new = new_fb.get(include=[])
+            if not existing_new["ids"]:
+                new_fb.add(
+                    ids=fb_data["ids"],
+                    documents=fb_data["documents"],
+                    metadatas=fb_data["metadatas"],
+                )
+            client.delete_collection(name="feedback_collection")
+    except Exception:
+        pass  # 旧集合不存在或其他错误，忽略
 
 
 # ============================================================================

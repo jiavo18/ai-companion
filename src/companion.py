@@ -2,8 +2,8 @@
 ===============================================================================
 核心编排类 —— Companion
 ===============================================================================
-整合情感检测、记忆管理、反馈学习、主动提问和系统提示词构建，
-提供统一的消息处理入口。替代原来的 process_user_message 函数。
+整合情感检测、记忆管理、反馈学习、主动提问、对话持久化和系统提示词构建，
+提供统一的消息处理入口。
 ===============================================================================
 """
 
@@ -21,6 +21,8 @@ from src.proactive import (
     DEFAULT_LAST_ACTIVE_FILE,
 )
 from src.prompt_builder import build_system_prompt
+from src.conversation import ConversationManager
+from src.database import DEFAULT_DB_PATH
 
 
 class Companion:
@@ -36,6 +38,7 @@ class Companion:
     6. 系统提示词构建
     7. LLM 调用
     8. 回复拼接
+    9. 对话持久化（自动保存到 SQLite）
     """
 
     def __init__(
@@ -43,6 +46,8 @@ class Companion:
         memory_collection,
         feedback_collection,
         ai_name: str = "禾苗",
+        user_id: int = 0,
+        db_path: str = DEFAULT_DB_PATH,
     ):
         """
         初始化 Companion 实例。
@@ -51,10 +56,14 @@ class Companion:
             memory_collection: ChromaDB 记忆集合
             feedback_collection: ChromaDB 反馈集合
             ai_name: AI 的名字
+            user_id: 当前用户 ID（用于对话持久化）
+            db_path: SQLite 数据库路径
         """
         self.memory_collection = memory_collection
         self.feedback_collection = feedback_collection
         self.ai_name = ai_name
+        self.user_id = user_id
+        self.conversation = ConversationManager(db_path=db_path)
 
     # ========================================================================
     # 核心消息处理
@@ -66,6 +75,7 @@ class Companion:
         conversation_history: list[dict],
         session_state: dict,
         llm,
+        session_id: str = "",
     ) -> str:
         """
         处理用户输入并生成 AI 回复。
@@ -183,6 +193,18 @@ class Companion:
 
         # —— 步骤9: 更新活跃时间 ——
         update_last_active_time(DEFAULT_LAST_ACTIVE_FILE)
+
+        # —— 步骤10: 对话持久化（自动保存到 SQLite） ——
+        if session_id and self.user_id:
+            try:
+                self.conversation.add_message(
+                    session_id, self.user_id, "user", user_input
+                )
+                self.conversation.add_message(
+                    session_id, self.user_id, "assistant", reply
+                )
+            except Exception:
+                pass  # 持久化失败不影响主流程
 
         return reply
 
