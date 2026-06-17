@@ -1,939 +1,107 @@
 """
-===============================================================================
-AI伴侣 —— 具备长期记忆、自我进化与情感感知的智能对话系统
-===============================================================================
-技术栈: Streamlit + LangChain + ChromaDB + DeepSeek API
-作者: AI Companion Project
-版本: 1.0.0
-===============================================================================
+AI伴侣 v2.0 —— 模块化架构
+UI 层(app.py) → 编排层(src/companion.py) → 功能模块(src/*.py)
 """
 
-# ============================================================================
-# 关键：必须在导入 chromadb 之前设置，解决 protobuf 兼容性问题
-# 参考: https://developers.google.com/protocol-buffers/docs/news/2022-05-06
-# ============================================================================
-import os
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+import os, streamlit as st
+from datetime import datetime
+from dotenv import load_dotenv
+load_dotenv()
 
-import streamlit as st
-import chromadb
-import json
-import uuid
-import re
-from datetime import datetime, timedelta
-from pathlib import Path
-
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-
-# 用于 embedding 的本地模型（轻量、免费、无需 API Key）
-from chromadb.utils import embedding_functions
-
-# 可选：情绪曲线图表
 try:
     import plotly.graph_objects as go
     HAS_PLOTLY = True
 except ImportError:
     HAS_PLOTLY = False
 
-# 环境变量支持
-from dotenv import load_dotenv
-load_dotenv()
+from src.chroma_client import create_embedding_function, create_chroma_client, get_or_create_collections, create_llm
+from src.memory import get_all_memories, delete_memory, clear_all_memories
+from src.proactive import get_last_active_time, DEFAULT_LAST_ACTIVE_FILE
+from src.companion import Companion
 
 # ============================================================================
-# 页面配置
+# 页面配置 & 样式
 # ============================================================================
-st.set_page_config(
-    page_title="AI伴侣 · 懂你的智能伙伴",
-    page_icon="◈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="AI伴侣 · 懂你的智能伙伴", page_icon="◈", layout="wide", initial_sidebar_state="expanded")
+st.markdown("<style>html,body,[class*='css']{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}.stButton>button{border-radius:8px;font-weight:500;transition:all .2s ease}</style>", unsafe_allow_html=True)
 
-# ============================================================================
-# 自定义 CSS 样式 —— 仅通过类选择器微调，不触碰 Streamlit 内部 DOM
-# ============================================================================
-st.markdown("""
-<style>
-    /* 全局字体 */
-    html, body, [class*="css"] {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    }
-    /* 按钮微调 */
-    .stButton > button {
-        border-radius: 8px;
-        font-weight: 500;
-        transition: all 0.2s ease;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ============================================================================
-# 常量定义
-# ============================================================================
-
-# —— 情感关键词库 ——
-EMOTION_KEYWORDS = {
-    "正面": [
-        "开心", "高兴", "快乐", "幸福", "满足", "激动", "期待",
-        "棒", "赞", "好", "喜欢", "爱", "太棒了", "优秀", "完美",
-        "感谢", "谢谢", "哈哈", "嘿嘿", "嘻嘻", "不错", "厉害",
-        "牛", "爽", "温暖", "感动", "惊喜", "欣慰", "自豪",
-    ],
-    "负面": [
-        "难过", "伤心", "失落", "生气", "愤怒", "讨厌", "烦",
-        "累", "疲惫", "焦虑", "害怕", "担心", "哭", "痛苦",
-        "难受", "郁闷", "烦躁", "崩溃", "绝望", "无助", "委屈",
-        "沮丧", "孤独", "寂寞", "失望", "后悔", "愧疚",
-    ],
-}
-
-# —— 主动关心触发关键词 ——
-CONCERN_PATTERNS = {
-    "熬夜": "注意到你最近经常提到熬夜，身体是革命的本钱，记得早点休息。",
-    "加班": "你最近似乎工作很忙，别忘了给自己留一些喘息的时间。",
-    "累": "感觉你状态有些疲惫，要不要听听轻音乐放松一下？",
-    "压力": "压力大的时候，深呼吸或者出去走走都会有帮助。",
-    "焦虑": "你提到了焦虑，我想告诉你，这种感觉很正常，慢慢来。",
-}
-
-# —— 记忆遗忘阈值（天） ——
-MEMORY_FORGET_DAYS = 30
-MEMORY_WEAKEN_DAYS = 14
-
-# —— 主动提问冷却时间（秒） —— 同一触发条件 1 小时内不重复
-PROACTIVE_COOLDOWN_SECONDS = 3600
-
-# —— 持久化路径 ——
 CHROMA_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
-LAST_ACTIVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_active.json")
 
 # ============================================================================
-# 资源缓存（使用 st.cache_resource 避免重复初始化）
+# 缓存资源
 # ============================================================================
+@st.cache_resource
+def _cached_embedding_function():
+    return create_embedding_function()
 
 @st.cache_resource
-def get_embedding_function():
-    """
-    获取嵌入函数。
-    使用 SentenceTransformer 的轻量中文支持模型，本地运行无需 API Key。
-    首次运行会自动下载模型（约 80MB），后续使用缓存。
-    """
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="paraphrase-multilingual-MiniLM-L12-v2"
-    )
-
+def _cached_chroma_client():
+    return create_chroma_client(persist_path=CHROMA_DB_PATH)
 
 @st.cache_resource
-def get_chroma_client():
-    """获取 ChromaDB 持久化客户端"""
-    return chromadb.PersistentClient(path=CHROMA_DB_PATH)
-
-
-@st.cache_resource
-def get_collections():
-    """
-    获取或创建 ChromaDB 集合。
-    返回:
-        memory_collection: 存储用户记忆
-        feedback_collection: 存储用户反馈
-    """
-    client = get_chroma_client()
-    ef = get_embedding_function()
-
-    memory_collection = client.get_or_create_collection(
-        name="user_memories",
-        embedding_function=ef,
-        metadata={"description": "用户长期记忆存储"},
-    )
-
-    feedback_collection = client.get_or_create_collection(
-        name="feedback_collection",
-        embedding_function=ef,
-        metadata={"description": "用户反馈与风格偏好"},
-    )
-
-    return memory_collection, feedback_collection
-
-
-def get_llm(api_key: str) -> ChatOpenAI:
-    """
-    获取 DeepSeek ChatOpenAI 实例。
-    使用 st.cache_resource 缓存，仅 api_key 变化时重建。
-    """
-    return ChatOpenAI(
-        api_key=api_key,
-        base_url="https://api.deepseek.com",
-        model="deepseek-chat",
-        temperature=0.72,
-        max_tokens=1024,
-        timeout=45,
-    )
+def _cached_companion():
+    client = _cached_chroma_client()
+    ef = _cached_embedding_function()
+    mem_col, fb_col = get_or_create_collections(client, ef)
+    return Companion(memory_collection=mem_col, feedback_collection=fb_col, ai_name=st.session_state.get("ai_name", "禾苗"))
 
 # ============================================================================
-# API Key 获取
+# API Key
 # ============================================================================
-
 def get_api_key() -> str | None:
-    """
-    获取 DeepSeek API Key。
-    优先级: 用户界面输入 > Streamlit Secrets > 环境变量(.env)
-    """
-    # 优先使用用户在界面中输入的 Key
-    user_key = st.session_state.get("user_api_key", "").strip()
-    if user_key:
-        return user_key
-
-    # 其次 Streamlit Cloud Secrets
+    """获取 API Key。优先级: 界面输入 > Secrets > .env"""
+    key = st.session_state.get("user_api_key", "").strip()
+    if key: return key
     try:
         key = st.secrets.get("DEEPSEEK_API_KEY", "")
-        if key:
-            return key
-    except (KeyError, FileNotFoundError):
-        pass
+        if key: return key
+    except: pass
+    return os.getenv("DEEPSEEK_API_KEY", "") or None
 
-    # 再次环境变量
-    env_key = os.getenv("DEEPSEEK_API_KEY", "")
-    if env_key:
-        return env_key
-
-    return None
 
 # ============================================================================
-# 情感分析模块
+# 会话状态
 # ============================================================================
-
-def detect_emotion(text: str) -> dict:
-    """
-    检测文本中的情感倾向。
-
-    参数:
-        text: 用户输入文本
-
-    返回:
-        {
-            "polarity": "正面" | "负面" | "中性",
-            "score": float (0~1, 情感强度),
-            "matched_keywords": [匹配到的关键词列表],
-        }
-    """
-    positive_count = 0
-    negative_count = 0
-    matched_pos = []
-    matched_neg = []
-
-    for keyword in EMOTION_KEYWORDS["正面"]:
-        if keyword in text:
-            count = text.count(keyword)
-            positive_count += count
-            matched_pos.append(keyword)
-
-    for keyword in EMOTION_KEYWORDS["负面"]:
-        if keyword in text:
-            count = text.count(keyword)
-            negative_count += count
-            matched_neg.append(keyword)
-
-    total = positive_count + negative_count
-
-    if total == 0:
-        return {"polarity": "中性", "score": 0.0, "matched_keywords": []}
-
-    if positive_count > negative_count:
-        score = positive_count / total
-        return {"polarity": "正面", "score": score, "matched_keywords": matched_pos}
-    elif negative_count > positive_count:
-        score = negative_count / total
-        return {"polarity": "负面", "score": score, "matched_keywords": matched_neg}
-    else:
-        return {"polarity": "中性", "score": 0.5, "matched_keywords": matched_pos + matched_neg}
-
-
-def get_emotion_response_guide(polarity: str) -> str:
-    """
-    根据情感极性返回回应语气指引。
-    """
-    if polarity == "正面":
-        return "用户情绪积极。请在回应中保持热情、活泼的语气，可以适当使用感叹号来表达共鸣。"
-    elif polarity == "负面":
-        return "用户情绪偏向负面。请使用温和、共情、安抚的语气。先表达理解与关心，再给出建议。避免过于轻快的表达。"
-    else:
-        return "用户情绪中性。请保持常规的友好、专业语气。"
-
-# ============================================================================
-# 长期记忆管理模块
-# ============================================================================
-
-def store_memory(content: str) -> str:
-    """
-    将一条记忆存入 ChromaDB。
-
-    参数:
-        content: 记忆文本内容
-
-    返回:
-        memory_id: 记忆的唯一标识
-    """
-    memory_collection, _ = get_collections()
-    memory_id = str(uuid.uuid4())[:8]
-    now = datetime.now().isoformat()
-
-    memory_collection.add(
-        ids=[memory_id],
-        documents=[content],
-        metadatas=[{
-            "created_at": now,
-            "last_accessed": now,
-            "access_count": 1,
-            "type": "user_memory",
-        }],
-    )
-
-    return memory_id
-
-
-def retrieve_memories(query: str, n_results: int = 3) -> list[dict]:
-    """
-    检索与当前查询最相关的记忆，并应用遗忘权重。
-
-    参数:
-        query: 查询文本
-        n_results: 返回的记忆数量
-
-    返回:
-        [{"content": str, "created_at": str, "access_count": int, "distance": float}, ...]
-    """
-    memory_collection, _ = get_collections()
-    now = datetime.now()
-
-    # 检索候选记忆（多取一些用于遗忘权重排序）
-    fetch_count = max(n_results * 3, 10)
-    try:
-        results = memory_collection.query(
-            query_texts=[query],
-            n_results=fetch_count,
-            include=["documents", "metadatas", "distances"],
-        )
-    except Exception:
-        return []
-
-    if not results["ids"] or not results["ids"][0]:
-        return []
-
-    memories = []
-    for i, mem_id in enumerate(results["ids"][0]):
-        doc = results["documents"][0][i]
-        meta = results["metadatas"][0][i]
-        distance = results["distances"][0][i]
-
-        # —— 遗忘权重计算 ——
-        try:
-            last_accessed = datetime.fromisoformat(meta.get("last_accessed", meta.get("created_at", now.isoformat())))
-            days_since_access = (now - last_accessed).days
-
-            # 超过遗忘阈值，加大距离（降低相关性）
-            if days_since_access > MEMORY_FORGET_DAYS:
-                distance *= 2.5
-            elif days_since_access > MEMORY_WEAKEN_DAYS:
-                distance *= 1.5
-        except (ValueError, TypeError):
-            pass
-
-        memories.append({
-            "id": mem_id,
-            "content": doc,
-            "created_at": meta.get("created_at", ""),
-            "last_accessed": meta.get("last_accessed", ""),
-            "access_count": meta.get("access_count", 1),
-            "distance": distance,
-        })
-
-    # 按调整后的距离排序（距离越小越相关）
-    memories.sort(key=lambda m: m["distance"])
-    selected = memories[:n_results]
-
-    # —— 更新访问记录 ——
-    memory_collection, _ = get_collections()
-    for mem in selected:
-        try:
-            memory_collection.update(
-                ids=[mem["id"]],
-                metadatas=[{
-                    "last_accessed": now.isoformat(),
-                    "access_count": mem["access_count"] + 1,
-                }],
-            )
-        except Exception:
-            pass
-
-    return selected
-
-
-def get_all_memories(limit: int = 20) -> list[dict]:
-    """获取所有已存储的记忆（用于可视化面板）"""
-    memory_collection, _ = get_collections()
-    try:
-        results = memory_collection.get(
-            include=["documents", "metadatas"],
-            limit=limit,
-        )
-    except Exception:
-        return []
-
-    if not results["ids"]:
-        return []
-
-    memories = []
-    for i, mem_id in enumerate(results["ids"]):
-        doc = results["documents"][i]
-        meta = results["metadatas"][i]
-        memories.append({
-            "id": mem_id,
-            "content": doc,
-            "created_at": meta.get("created_at", ""),
-            "access_count": meta.get("access_count", 1),
-        })
-
-    # 按创建时间倒序
-    memories.sort(key=lambda m: m["created_at"], reverse=True)
-    return memories
-
-
-def delete_memory(memory_id: str) -> bool:
-    """删除单条记忆"""
-    try:
-        memory_collection, _ = get_collections()
-        memory_collection.delete(ids=[memory_id])
-        return True
-    except Exception:
-        return False
-
-
-def clear_all_memories() -> bool:
-    """清空所有记忆"""
-    try:
-        memory_collection, feedback_collection = get_collections()
-        # 获取所有 ID 并删除
-        all_mem = memory_collection.get(include=[])
-        if all_mem["ids"]:
-            memory_collection.delete(ids=all_mem["ids"])
-        all_fb = feedback_collection.get(include=[])
-        if all_fb["ids"]:
-            feedback_collection.delete(ids=all_fb["ids"])
-        return True
-    except Exception:
-        return False
-
-# ============================================================================
-# 反馈学习模块
-# ============================================================================
-
-def store_feedback(content: str) -> str:
-    """
-    将用户反馈存入反馈集合。
-
-    参数:
-        content: 反馈内容（如"回答太长了，精简一点"）
-
-    返回:
-        feedback_id: 反馈标识
-    """
-    _, feedback_collection = get_collections()
-    feedback_id = str(uuid.uuid4())[:8]
-    now = datetime.now().isoformat()
-
-    feedback_collection.add(
-        ids=[feedback_id],
-        documents=[content],
-        metadatas=[{
-            "created_at": now,
-        }],
-    )
-
-    return feedback_id
-
-
-def retrieve_feedback(n_results: int = 3) -> list[str]:
-    """
-    检索最新的用户反馈。
-    使用一个通用查询词来获取所有反馈，按时间排序取最近 N 条。
-    """
-    _, feedback_collection = get_collections()
-    try:
-        results = feedback_collection.get(
-            include=["documents", "metadatas"],
-        )
-    except Exception:
-        return []
-
-    if not results["ids"]:
-        return []
-
-    # 按创建时间排序
-    items = []
-    for i, fb_id in enumerate(results["ids"]):
-        doc = results["documents"][i]
-        meta = results["metadatas"][i]
-        items.append({
-            "id": fb_id,
-            "content": doc,
-            "created_at": meta.get("created_at", ""),
-        })
-
-    items.sort(key=lambda x: x["created_at"], reverse=True)
-    return [item["content"] for item in items[:n_results]]
-
-
-def parse_feedback_to_constraints(feedbacks: list[str]) -> str:
-    """
-    将用户反馈解析为系统约束文本。
-    提取常见模式并生成具体的约束指令。
-    """
-    if not feedbacks:
-        return ""
-
-    constraints = []
-    for fb in feedbacks:
-        fb_lower = fb.lower()
-
-        # 规则匹配
-        if any(w in fb_lower for w in ["精简", "啰嗦", "太长", "简短", "简洁", "少说"]):
-            constraints.append("回答应尽量简洁精炼，控制在100字以内，避免冗余表达。")
-        elif any(w in fb_lower for w in ["详细", "多说", "展开", "深入"]):
-            constraints.append("回答应更加详细深入，提供充分的解释和背景信息。")
-        if any(w in fb_lower for w in ["温柔", "温和", "语气", "态度好"]):
-            constraints.append("请使用更加温和、柔和的语气。")
-        if any(w in fb_lower for w in ["幽默", "搞笑", "有趣"]):
-            constraints.append("请在回答中适当加入幽默感，让对话更轻松。")
-        if any(w in fb_lower for w in ["专业", "严谨", "认真"]):
-            constraints.append("请保持专业严谨的表达风格。")
-
-        # 如果没有匹配到规则，保留原文作为软约束
-        if not constraints or constraints[-1] not in [
-            "回答应尽量简洁精炼，控制在100字以内，避免冗余表达。",
-            "回答应更加详细深入，提供充分的解释和背景信息。",
-            "请使用更加温和、柔和的语气。",
-            "请在回答中适当加入幽默感，让对话更轻松。",
-            "请保持专业严谨的表达风格。",
-        ]:
-            constraints.append(f"用户偏好：{fb}")
-
-    # 去重
-    seen = set()
-    unique_constraints = []
-    for c in constraints:
-        if c not in seen:
-            seen.add(c)
-            unique_constraints.append(c)
-
-    return "\n".join(f"- {c}" for c in unique_constraints)
-
-# ============================================================================
-# 主动提问模块（升级版）
-#   触发条件：
-#     1. 超过 24 小时未对话 → 时间间隔触发
-#     2. 最近 3 轮用户消息中连续出现压力关键词 → 关键词连续触发
-#   冷却机制：同一触发类型在 1 小时内不重复
-# ============================================================================
-
-# —— 压力关键词列表（用于连续检测） ——
-STRESS_KEYWORDS = ["累", "加班", "压力", "熬夜", "疲惫", "焦虑", "忙", "烦躁", "崩溃"]
-
-
-def _is_in_cooldown(trigger_type: str) -> bool:
-    """
-    检查指定触发类型是否在冷却期内。
-
-    参数:
-        trigger_type: "time_gap" 或 "keyword_stress"
-
-    返回:
-        True 表示冷却中，不应再次触发
-    """
-    last_time = st.session_state.last_proactive_time.get(trigger_type)
-    if last_time is None:
-        return False
-    elapsed = (datetime.now() - last_time).total_seconds()
-    return elapsed < PROACTIVE_COOLDOWN_SECONDS
-
-
-def _record_trigger(trigger_type: str):
-    """
-    记录触发时间戳，启动冷却。
-
-    参数:
-        trigger_type: "time_gap" 或 "keyword_stress"
-    """
-    st.session_state.last_proactive_time[trigger_type] = datetime.now()
-
-
-def get_last_active_time() -> datetime | None:
-    """从本地文件读取上次活跃时间"""
-    try:
-        if os.path.exists(LAST_ACTIVE_FILE):
-            with open(LAST_ACTIVE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return datetime.fromisoformat(data["last_active"])
-    except Exception:
-        pass
-    return None
-
-
-def update_last_active_time():
-    """更新本地活跃时间戳"""
-    try:
-        with open(LAST_ACTIVE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"last_active": datetime.now().isoformat()}, f, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-def check_trigger_conditions(user_input: str, conversation_history: list[dict]) -> str | None:
-    """
-    检测主动提问触发条件，返回关心语句或 None。
-
-    触发条件 1 —— 时间间隔触发：
-        如果用户超过 24 小时未对话，且该类型不在冷却期，
-        生成一句欢迎/关心问候。
-
-    触发条件 2 —— 关键词连续触发：
-        如果用户在过去 3 轮对话中，每条消息都包含压力关键词，
-        且该类型不在冷却期，生成一句放松建议。
-
-    参数:
-        user_input: 当前用户输入文本
-        conversation_history: 完整对话历史
-
-    返回:
-        主动提问文本（将作为 AI 回答的第一句话），无触发则返回 None
-    """
-    now = datetime.now()
-    care_parts = []
-
-    # ============================================================
-    # 触发条件 1：超过 24 小时未对话
-    # ============================================================
-    if not _is_in_cooldown("time_gap"):
-        last_active = get_last_active_time()
-        if last_active:
-            hours_since = (now - last_active).total_seconds() / 3600
-            if hours_since > 24:
-                days = int(hours_since / 24)
-                care_parts.append(
-                    f"已经 {days} 天没聊了，最近过得怎么样？有什么想和我分享的吗？"
-                )
-                _record_trigger("time_gap")
-
-    # ============================================================
-    # 触发条件 2：最近 3 轮用户消息连续包含压力关键词
-    # ============================================================
-    if not _is_in_cooldown("keyword_stress"):
-        # 收集最近 3 条用户消息（不含当前）
-        user_messages = [
-            msg.get("content", "")
-            for msg in conversation_history
-            if msg.get("role") == "user"
-        ]
-        # 取最近 2 条 + 当前输入 = 共 3 条
-        recent_user_texts = user_messages[-2:] + [user_input]
-
-        if len(recent_user_texts) >= 3:
-            # 检查每条消息是否至少包含一个压力关键词
-            all_stressed = all(
-                any(kw in text for kw in STRESS_KEYWORDS)
-                for text in recent_user_texts[-3:]
-            )
-            if all_stressed:
-                # 找出最后一条消息中匹配到的关键词，生成针对性建议
-                last_text = recent_user_texts[-1]
-                matched = [kw for kw in STRESS_KEYWORDS if kw in last_text]
-                if "加班" in matched or "忙" in matched:
-                    suggestion = "你最近似乎工作很忙，别忘了给自己留一些喘息的时间。"
-                elif "累" in matched or "疲惫" in matched:
-                    suggestion = "感觉你最近挺疲惫的，要不要听听轻音乐放松一下？"
-                elif "熬夜" in matched:
-                    suggestion = "注意到你最近经常熬夜，身体是革命的本钱，记得早点休息。"
-                elif "压力" in matched or "焦虑" in matched or "烦躁" in matched:
-                    suggestion = "你好像压力有点大，深呼吸或者出去走走都会有帮助。"
-                else:
-                    suggestion = "最近辛苦了，要不要给自己放个小假调整一下？"
-
-                care_parts.append(suggestion)
-                _record_trigger("keyword_stress")
-
-    if care_parts:
-        return " ".join(care_parts)
-
-    return None
-
-# ============================================================================
-# 系统提示词构建器
-# ============================================================================
-
-def build_system_prompt(
-    memories: list[dict],
-    feedback_constraints: str,
-    emotion_guide: str,
-    proactive_care: str | None,
-) -> str:
-    """
-    动态构建系统提示词，整合所有上下文信息。
-
-    参数:
-        memories: 检索到的用户记忆
-        feedback_constraints: 反馈约束文本
-        emotion_guide: 情感回应指引
-        proactive_care: 主动关心语句（可选）
-
-    返回:
-        完整的系统提示词
-    """
-    prompt_parts = [
-        "你是一位善解人意、温和体贴的AI伴侣。你的名字是「禾苗」。",
-        "",
-        "## 核心原则",
-        "- 你是用户值得信赖的朋友，而非冷冰冰的工具。",
-        "- 回答真诚自然，像一个了解你的朋友在聊天。",
-        "- 如果用户询问建议，结合你对用户的了解给出个性化建议。",
-        "- 不要使用过于机械或模板化的表达。",
-        "",
-    ]
-
-    # —— 用户反馈约束 ——
-    if feedback_constraints:
-        prompt_parts.append("## 用户偏好（请严格遵守）")
-        prompt_parts.append(feedback_constraints)
-        prompt_parts.append("")
-
-    # —— 相关记忆 ——
-    if memories:
-        prompt_parts.append("## 关于用户的重要记忆")
-        for i, mem in enumerate(memories, 1):
-            created = mem.get("created_at", "")[:10] if mem.get("created_at") else ""
-            prompt_parts.append(f"{i}. {mem['content']}（记录于 {created}）")
-        prompt_parts.append("请在回答中自然地融入这些记忆，让用户感受到你真正记得关于TA的事。")
-        prompt_parts.append("")
-
-    # —— 情感指引 ——
-    prompt_parts.append("## 当前回应策略")
-    prompt_parts.append(emotion_guide)
-    prompt_parts.append("")
-
-    # —— 主动关心 ——
-    if proactive_care:
-        prompt_parts.append("## 主动关心")
-        prompt_parts.append(f"请在回答中自然地加入以下关心：{proactive_care}")
-        prompt_parts.append("不要生硬地插入，要自然地融入回答中。")
-        prompt_parts.append("")
-
-    return "\n".join(prompt_parts)
-
-# ============================================================================
-# 会话状态初始化
-# ============================================================================
-
 def init_session_state():
-    """初始化所有会话状态变量"""
-    defaults = {
-        "messages": [],                # 对话历史 [{"role": "user"|"assistant", "content": str}, ...]
-        "emotion_history": [],         # 情绪记录 [{"time": str, "polarity": str, "score": float}, ...]
-        "api_key_verified": False,     # API Key 是否已验证
-        "memory_count": 0,             # 当前记忆总数
-        "user_api_key": "",            # 用户在界面输入的 API Key
-        "last_proactive_time": {},     # 主动提问冷却记录 {"time_gap": timestamp, "keyword_stress": timestamp}
-        # —— 头像与昵称设置 ——
-        "user_avatar": "👤",           # 用户头像（emoji 或图片 URL）
-        "ai_avatar": "🌱",             # AI 头像（emoji 或图片 URL）
-        "user_name": "我",             # 用户显示名称
-        "ai_name": "禾苗",             # AI 显示名称
-    }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+    D = {"messages":[],"emotion_history":[],"api_key_verified":False,"memory_count":0,
+         "user_api_key":"","last_proactive_time":{},"user_avatar":"👤","ai_avatar":"🌱","user_name":"我","ai_name":"禾苗"}
+    for k,v in D.items():
+        if k not in st.session_state: st.session_state[k] = v
 
 # ============================================================================
-# 消息处理主逻辑
+# 记忆面板
 # ============================================================================
-
-def process_user_message(user_input: str, llm: ChatOpenAI) -> str:
-    """
-    处理用户输入并生成 AI 回复。
-
-    处理流程（按顺序）:
-    1. 判断是否为记忆/反馈指令
-    2. 主动提问检测（在 LLM 调用前完成，结果作为回复前缀）
-    3. 情感检测
-    4. 记忆检索
-    5. 反馈检索
-    6. 构建系统提示词（不再包含主动关心，已移至步骤2）
-    7. 调用 LLM
-    8. 将主动提问文本拼接为回复的第一句话
-    """
-    user_input = user_input.strip()
-
-    # —— 步骤0: 指令识别 ——
-    # 记忆指令: "记住：xxx" 或 "记住:xxx"
-    remember_match = re.match(r"^记住[：:]\s*(.+)", user_input)
-    if remember_match:
-        content = remember_match.group(1).strip()
-        if content:
-            mem_id = store_memory(content)
-            update_last_active_time()
-            st.session_state.memory_count += 1
-            return f"已牢记：「{content}」。以后你需要的时候，我会想起这个信息。"
-
-    # 反馈指令: "反馈：xxx" 或 "反馈:xxx"
-    feedback_match = re.match(r"^反馈[：:]\s*(.+)", user_input)
-    if feedback_match:
-        content = feedback_match.group(1).strip()
-        if content:
-            fb_id = store_feedback(content)
-            update_last_active_time()
-            return f"已收到你的反馈：「{content}」。我会在后续对话中调整我的表达方式。"
-
-    # —— 步骤1: 主动提问检测（在 LLM 调用前完成判断） ——
-    # 返回的 proactive_text 将作为 AI 回复的第一句话
-    proactive_text = check_trigger_conditions(user_input, st.session_state.messages)
-
-    # —— 步骤2: 情感检测 ——
-    emotion_result = detect_emotion(user_input)
-    emotion_guide = get_emotion_response_guide(emotion_result["polarity"])
-
-    # 记录情绪
-    st.session_state.emotion_history.append({
-        "time": datetime.now().isoformat(),
-        "polarity": emotion_result["polarity"],
-        "score": emotion_result["score"],
-    })
-    # 只保留最近 100 条情绪记录
-    if len(st.session_state.emotion_history) > 100:
-        st.session_state.emotion_history = st.session_state.emotion_history[-100:]
-
-    # —— 步骤3: 记忆检索 ——
-    memories = retrieve_memories(user_input, n_results=3)
-
-    # —— 步骤4: 反馈检索 ——
-    feedbacks = retrieve_feedback(n_results=3)
-    feedback_constraints = parse_feedback_to_constraints(feedbacks)
-
-    # —— 步骤5: 构建系统提示词（主动关心已移至步骤1，不再入系统提示） ——
-    system_prompt = build_system_prompt(
-        memories=memories,
-        feedback_constraints=feedback_constraints,
-        emotion_guide=emotion_guide,
-        proactive_care=None,  # 不再通过系统提示词注入
-    )
-
-    # —— 步骤6: 构建消息列表 ——
-    messages = [SystemMessage(content=system_prompt)]
-
-    # 加入最近 20 轮对话历史
-    recent_history = st.session_state.messages[-20:]
-    for msg in recent_history:
-        if msg["role"] == "user":
-            messages.append(HumanMessage(content=msg["content"]))
-        else:
-            messages.append(AIMessage(content=msg["content"]))
-
-    # 当前用户消息
-    messages.append(HumanMessage(content=user_input))
-
-    # —— 步骤7: 调用 LLM ——
-    try:
-        response = llm.invoke(messages)
-        llm_reply = response.content
-    except Exception as e:
-        llm_reply = f"抱歉，我暂时无法回应。请检查网络连接或API配置。（错误详情：{str(e)}）"
-
-    # —— 步骤8: 拼接回复 ——
-    # 如果触发了主动提问，将其作为回复的第一句话
-    if proactive_text:
-        reply = f"{proactive_text}\n\n{llm_reply}"
-    else:
-        reply = llm_reply
-
-    # —— 步骤9: 更新活跃时间 ——
-    update_last_active_time()
-
-    return reply
-
-# ============================================================================
-# 验证 API Key 是否有效
-# ============================================================================
-
-def verify_api_key(api_key: str) -> bool:
-    """快速验证 API Key 是否有效"""
-    try:
-        llm = get_llm(api_key)
-        response = llm.invoke([HumanMessage(content="你好，请回复一个字：好")])
-        return bool(response.content.strip())
-    except Exception:
-        return False
-
-# ============================================================================
-# 记忆可视化面板（独立模块）
-#   位置：侧边栏底部，折叠式面板
-#   内容：向量数据库中存储的用户记忆条目（最多 20 条）
-#   操作：逐条删除 + 清空全部
-# ============================================================================
-
 def render_memory_panel():
-    """
-    渲染记忆可视化面板。
-
-    从 ChromaDB 的 user_memories 集合中读取所有记忆条目，
-    以折叠面板形式展示在侧边栏中。每条记忆显示原文和存储时间，
-    提供单条删除和清空全部按钮。
-    """
     st.markdown("### 记忆档案")
-
-    # 从 ChromaDB 获取所有记忆（最多 20 条）
-    memories = get_all_memories(limit=20)
-
-    # —— 统计行：记忆数量 + 清空按钮 ——
-    col_count, col_clear = st.columns([2, 1])
-    with col_count:
-        st.metric("已存储记忆", len(memories))
-    with col_clear:
-        if memories:
-            if st.button("清空全部", type="secondary", use_container_width=True):
-                if clear_all_memories():
-                    st.session_state.memory_count = 0
-                    st.rerun()
-
-    # —— 记忆列表（可滚动容器） ——
+    companion = _cached_companion()
+    memories = get_all_memories(companion.memory_collection, limit=20)
+    c1,c2 = st.columns([2,1])
+    with c1: st.metric("已存储记忆", len(memories))
+    with c2:
+        if memories and st.button("清空全部", type="secondary", use_container_width=True):
+            if clear_all_memories(companion.memory_collection, companion.feedback_collection):
+                st.session_state.memory_count = 0; st.rerun()
     if memories:
         with st.container(height=320):
             for mem in memories:
-                # 格式化存储时间
-                created_str = (
-                    mem["created_at"][:16].replace("T", " ")
-                    if mem["created_at"] else "未知"
-                )
-                # 折叠面板：标题显示记忆内容前 40 字
+                ts = mem["created_at"][:16].replace("T"," ") if mem["created_at"] else "未知"
                 with st.expander(f"{mem['content'][:40]}...", expanded=False):
-                    st.caption(f"存储时间：{created_str}")
-                    st.caption(f"访问次数：{mem['access_count']}")
-                    # 单条删除按钮
+                    st.caption(f"存储时间：{ts}"); st.caption(f"访问次数：{mem['access_count']}")
                     if st.button("删除此记忆", key=f"del_{mem['id']}", type="secondary"):
-                        if delete_memory(mem["id"]):
-                            st.session_state.memory_count = max(
-                                0, st.session_state.memory_count - 1
-                            )
-                            st.rerun()
+                        if delete_memory(companion.memory_collection, mem["id"]):
+                            st.session_state.memory_count = max(0, st.session_state.memory_count - 1); st.rerun()
     else:
         st.caption("暂无记忆。对我说「记住：xxx」来添加记忆。")
 
 
 # ============================================================================
-# 界面渲染 —— 侧边栏
+# 侧边栏渲染
 # ============================================================================
 
 def render_sidebar():
-    """渲染侧边栏：API配置 + 记忆面板 + 情绪图表"""
-
+    """渲染侧边栏：品牌、API配置、个性化设置、记忆面板、情绪图表"""
     with st.sidebar:
-        # —— 品牌标识 —— 使用原生组件，避免 DOM 冲突
+        # —— 品牌标识 ——
         st.title("禾 苗")
         st.caption("AI Companion")
 
@@ -942,7 +110,6 @@ def render_sidebar():
         # —— API Key 配置 ——
         st.markdown("### API 配置")
 
-        # 检测是否已有 Secrets 中的 Key
         has_secret_key = False
         try:
             has_secret_key = bool(st.secrets.get("DEEPSEEK_API_KEY", ""))
@@ -970,7 +137,7 @@ def render_sidebar():
 
             if save_clicked and user_key_input.strip():
                 st.session_state.user_api_key = user_key_input.strip()
-                st.session_state.api_key_verified = False  # 触发重新验证
+                st.session_state.api_key_verified = False
                 st.rerun()
 
             if clear_clicked:
@@ -978,10 +145,12 @@ def render_sidebar():
                 st.session_state.api_key_verified = False
                 st.rerun()
 
-            # 验证用户输入的 Key
+            # 验证 Key
             if st.session_state.get("user_api_key", "") and not st.session_state.api_key_verified:
                 with st.spinner("正在验证 API Key..."):
-                    if verify_api_key(st.session_state.user_api_key):
+                    if Companion.verify_api_key(
+                        st.session_state.user_api_key, create_llm
+                    ):
                         st.session_state.api_key_verified = True
                         st.rerun()
                     else:
@@ -1000,73 +169,59 @@ def render_sidebar():
 
         st.markdown("---")
 
-        # —— 头像与昵称设置 ——
+        # —— 个性化设置 ——
         with st.expander("个性化设置"):
-            # 预设头像库
             AVATAR_PRESETS = {
                 "用户": ["👤", "🧑", "👩", "👨", "😊", "🐱", "🐶", "🦊", "🐼", "⭐"],
                 "AI":   ["🌱", "🤖", "✨", "🌟", "💡", "🌸", "🍀", "🎵", "💎", "🔥"],
             }
 
             st.caption("用户头像")
-            col_user_avatars = st.columns(5)
+            cols = st.columns(5)
             for i, emoji in enumerate(AVATAR_PRESETS["用户"]):
-                with col_user_avatars[i % 5]:
-                    if st.button(emoji, key=f"ua_{emoji}", use_container_width=True,
-                                 help=f"选择 {emoji} 作为你的头像"):
+                with cols[i % 5]:
+                    if st.button(emoji, key=f"ua_{emoji}", use_container_width=True):
                         st.session_state.user_avatar = emoji
                         st.rerun()
 
             st.caption("AI 头像")
-            col_ai_avatars = st.columns(5)
+            cols = st.columns(5)
             for i, emoji in enumerate(AVATAR_PRESETS["AI"]):
-                with col_ai_avatars[i % 5]:
-                    if st.button(emoji, key=f"aa_{emoji}", use_container_width=True,
-                                 help=f"选择 {emoji} 作为 AI 头像"):
+                with cols[i % 5]:
+                    if st.button(emoji, key=f"aa_{emoji}", use_container_width=True):
                         st.session_state.ai_avatar = emoji
                         st.rerun()
 
-            # 自定义昵称
-            col_name1, col_name2 = st.columns(2)
-            with col_name1:
-                new_user_name = st.text_input(
-                    "你的昵称", value=st.session_state.user_name,
-                    placeholder="我", max_chars=10
-                )
-                if new_user_name and new_user_name != st.session_state.user_name:
-                    st.session_state.user_name = new_user_name
+            col1, col2 = st.columns(2)
+            with col1:
+                new_name = st.text_input("你的昵称", value=st.session_state.user_name, max_chars=10)
+                if new_name and new_name != st.session_state.user_name:
+                    st.session_state.user_name = new_name
                     st.rerun()
-            with col_name2:
-                new_ai_name = st.text_input(
-                    "AI 昵称", value=st.session_state.ai_name,
-                    placeholder="禾苗", max_chars=10
-                )
-                if new_ai_name and new_ai_name != st.session_state.ai_name:
-                    st.session_state.ai_name = new_ai_name
+            with col2:
+                new_ai = st.text_input("AI 昵称", value=st.session_state.ai_name, max_chars=10)
+                if new_ai and new_ai != st.session_state.ai_name:
+                    st.session_state.ai_name = new_ai
                     st.rerun()
 
-            # 当前预览
             st.caption(
                 f"预览：{st.session_state.user_avatar} {st.session_state.user_name}"
-                f"  ⇄  "
-                f"{st.session_state.ai_avatar} {st.session_state.ai_name}"
+                f"  ⇄  {st.session_state.ai_avatar} {st.session_state.ai_name}"
             )
 
         st.markdown("---")
 
-        # —— 记忆可视化面板（调用独立模块） ——
+        # —— 记忆可视化面板 ——
         render_memory_panel()
 
         st.markdown("---")
 
-        # —— 情绪曲线图表 ——
+        # —— 情绪曲线 ——
         st.markdown("### 情绪脉动")
 
         if st.session_state.emotion_history and HAS_PLOTLY:
-            # 准备数据
-            times = []
-            scores = []
-            for record in st.session_state.emotion_history[-30:]:  # 最近30条
+            times, scores = [], []
+            for record in st.session_state.emotion_history[-30:]:
                 try:
                     t = datetime.fromisoformat(record["time"])
                     times.append(t)
@@ -1082,36 +237,21 @@ def render_sidebar():
             if times:
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
-                    x=times,
-                    y=scores,
-                    mode="lines+markers",
-                    name="情绪值",
+                    x=times, y=scores, mode="lines+markers", name="情绪值",
                     line=dict(color="#5b7fff", width=1.5),
-                    marker=dict(
-                        size=6,
-                        color=[
-                            "#4caf50" if s > 0 else "#f44336" if s < 0 else "#9e9e9e"
-                            for s in scores
-                        ],
-                    ),
-                    fill="tozeroy",
-                    fillcolor="rgba(91,127,255,0.08)",
+                    marker=dict(size=6, color=[
+                        "#4caf50" if s > 0 else "#f44336" if s < 0 else "#9e9e9e"
+                        for s in scores
+                    ]),
+                    fill="tozeroy", fillcolor="rgba(91,127,255,0.08)",
                 ))
                 fig.add_hline(y=0, line_dash="dot", line_color="#ccc", opacity=0.5)
                 fig.update_layout(
-                    height=180,
-                    margin=dict(l=0, r=0, t=8, b=0),
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
+                    height=180, margin=dict(l=0, r=0, t=8, b=0),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
-                    yaxis=dict(
-                        showgrid=False,
-                        showticklabels=False,
-                        zeroline=False,
-                        range=[-1.2, 1.2],
-                    ),
-                    showlegend=False,
-                    hovermode="x",
+                    yaxis=dict(showgrid=False, showticklabels=False, zeroline=False, range=[-1.2, 1.2]),
+                    showlegend=False, hovermode="x",
                 )
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                 st.caption("最近情绪波动曲线（绿=正面 / 红=负面）")
@@ -1125,7 +265,7 @@ def render_sidebar():
         # —— 关于 ——
         with st.expander("关于禾苗"):
             st.markdown("""
-            **禾苗 AI 伴侣** v1.0
+            **禾苗 AI 伴侣** v2.0
 
             核心能力：
             - 长期记忆存储与检索
@@ -1138,30 +278,28 @@ def render_sidebar():
             Streamlit · LangChain · ChromaDB · DeepSeek
             """)
 
+
 # ============================================================================
-# 界面渲染 —— 主区域
+# 主区域渲染
 # ============================================================================
 
 def render_main():
     """渲染主对话区域"""
-
-    # —— 标题 —— 使用原生组件
     st.title("禾 苗")
     st.caption("你的 AI 伴侣")
 
-    # —— 首次使用提示 ——
     api_key = get_api_key()
     if not api_key:
         st.info(
-            "请先配置 DeepSeek API Key。在项目根目录创建 `.env` 文件并添加 "
-            "`DEEPSEEK_API_KEY=sk-xxxxx`，或在 Streamlit Cloud 的 Secrets 中设置。\n\n"
+            "请先配置 DeepSeek API Key。在侧边栏输入 Key，"
+            "或在项目根目录创建 `.env` 文件并添加 `DEEPSEEK_API_KEY=sk-xxxxx`。\n\n"
             "获取 Key：[platform.deepseek.com](https://platform.deepseek.com)"
         )
         return
 
     if not st.session_state.api_key_verified:
         with st.spinner("正在验证 API 连接..."):
-            if verify_api_key(api_key):
+            if Companion.verify_api_key(api_key, create_llm):
                 st.session_state.api_key_verified = True
                 st.rerun()
             else:
@@ -1170,14 +308,14 @@ def render_main():
 
     # —— 首次欢迎语 ——
     if not st.session_state.messages:
-        last_active = get_last_active_time()
+        last_active = get_last_active_time(DEFAULT_LAST_ACTIVE_FILE)
         if last_active:
             hours_since = (datetime.now() - last_active).total_seconds() / 3600
             if hours_since > 24:
                 days = int(hours_since / 24)
-                welcome_msg = f"欢迎回来！已经 {days} 天没见了，最近过得怎么样？有什么想聊的或者需要我帮忙的吗？"
+                welcome_msg = f"欢迎回来！已经 {days} 天没见了，最近过得怎么样？"
             else:
-                welcome_msg = "你好！我是禾苗，你的AI伴侣。你可以和我聊天、让我记住关于你的事，我会越来越了解你。"
+                welcome_msg = "你好！我是禾苗，你的AI伴侣。我会越来越了解你。"
         else:
             welcome_msg = (
                 "你好，我是**禾苗**，你的 AI 伴侣。\n\n"
@@ -1188,21 +326,11 @@ def render_main():
                 "- 在需要时主动关心你\n\n"
                 "让我们开始对话吧！"
             )
+        st.session_state.messages.append({"role": "assistant", "content": welcome_msg})
 
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": welcome_msg,
-        })
-
-    # —— 渲染对话历史（使用用户设定的头像和昵称） ——
+    # —— 渲染对话历史 ——
     for msg in st.session_state.messages:
-        # 根据角色选择头像
-        if msg["role"] == "user":
-            avatar = st.session_state.user_avatar
-            label = st.session_state.user_name
-        else:
-            avatar = st.session_state.ai_avatar
-            label = st.session_state.ai_name
+        avatar = st.session_state.user_avatar if msg["role"] == "user" else st.session_state.ai_avatar
         with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"])
 
@@ -1210,12 +338,12 @@ def render_main():
     user_input = st.chat_input("输入消息...（支持指令：记住：xxx / 反馈：xxx）")
 
     if user_input:
-        # 检查 API Key
         if not st.session_state.api_key_verified:
             st.warning("API 连接尚未就绪，请刷新页面重试。")
             return
 
-        llm = get_llm(api_key)
+        llm = create_llm(api_key)
+        companion = _cached_companion()
 
         # 添加用户消息
         st.session_state.messages.append({"role": "user", "content": user_input})
@@ -1226,13 +354,17 @@ def render_main():
         # 生成 AI 回复
         with st.chat_message("assistant", avatar=st.session_state.ai_avatar):
             with st.spinner(""):
-                reply = process_user_message(user_input, llm)
-
+                reply = companion.process_message(
+                    user_input=user_input,
+                    conversation_history=st.session_state.messages,
+                    session_state=st.session_state,
+                    llm=llm,
+                )
             st.markdown(reply)
 
-        # 保存 AI 回复
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
+
 
 # ============================================================================
 # 程序入口
@@ -1243,6 +375,5 @@ if __name__ == "__main__":
     render_sidebar()
     render_main()
 
-    # 页脚
     st.divider()
     st.caption("HeMiao AI Companion · Powered by Streamlit + LangChain + ChromaDB + DeepSeek")
