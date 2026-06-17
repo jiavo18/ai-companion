@@ -61,6 +61,7 @@ def init_session_state():
         "logged_in": False, "current_user": None, "current_session_id": "",
         "messages": [], "emotion_history": [], "api_key_verified": False,
         "auto_extract_enabled": True,  # 自动记忆提取开关
+        "emotion_mode": "keyword",    # 情感检测模式: keyword / llm
         "memory_count": 0, "user_api_key": "", "last_proactive_time": {},
         "user_avatar": "👤", "ai_avatar": "🌱", "user_name": "我", "ai_name": "禾苗",
         "companion": None,
@@ -251,6 +252,14 @@ def render_sidebar():
                         key="auto_extract_toggle",
                         help="开启后AI会自动从对话中识别并记住你的信息。关闭后仅手动「记住：xxx」指令生效。",
                         on_change=lambda: setattr(st.session_state, "auto_extract_enabled", st.session_state.auto_extract_toggle))
+
+            # 情感检测模式
+            st.radio("情感检测模式", options=["keyword", "llm"],
+                     index=0 if st.session_state.emotion_mode == "keyword" else 1,
+                     format_func=lambda x: "关键词匹配（快）" if x == "keyword" else "LLM 分析（准）",
+                     key="emotion_mode_radio",
+                     help="关键词：零延迟零成本。LLM：更准确，能理解「烦死了今天怎么这么开心」是正面情绪。",
+                     on_change=lambda: setattr(st.session_state, "emotion_mode", st.session_state.emotion_mode_radio))
 
             st.markdown("---")
 

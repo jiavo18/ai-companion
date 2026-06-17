@@ -82,6 +82,74 @@ def detect_emotion(text: str) -> dict:
 
 
 # ============================================================================
+# LLM 情感分析（比关键词更准，理解语义而非匹配字词）
+# ============================================================================
+
+LLM_EMOTION_PROMPT = """分析这句话的情感，严格只返回JSON（不要其他文字）：
+"{text}"
+{"polarity":"正面/负面/中性","score":0.0~1.0,"emotion":"具体情感名称"}"""
+
+
+def detect_emotion_llm(text: str, llm) -> dict:
+    """
+    用 LLM 做情感分析，理解语义而非简单关键词匹配。
+
+    优势：能区分"烦死了今天怎么这么开心"（正面）和"我好难过"（负面），
+          关键词模式会被"烦"字误导。
+
+    参数:
+        text: 用户输入文本
+        llm: ChatOpenAI 实例（共用对话 LLM，不额外调 API）
+
+    返回:
+        {
+            "polarity": "正面" | "负面" | "中性",
+            "score": float (0~1),
+            "emotion": str (具体情感名称，如"焦虑"/"兴奋"/"失落"/"满足"),
+            "mode": "llm",
+        }
+        失败时 fallback 到关键词模式
+    """
+    import re
+    import json
+    from langchain_core.messages import HumanMessage
+
+    prompt = LLM_EMOTION_PROMPT.format(text=text)
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw = response.content.strip()
+
+        # 提取 JSON（LLM 有时会在外面包说明文字）
+        json_match = re.search(r'\{[^{}]*"polarity"[^{}]*\}', raw, re.DOTALL)
+        if json_match:
+            raw = json_match.group(0)
+
+        data = json.loads(raw)
+        polarity = data.get("polarity", "中性")
+
+        # 标准化极性值
+        if polarity not in ("正面", "负面", "中性"):
+            polarity = "中性"
+
+        score = float(data.get("score", 0.5))
+        score = max(0.0, min(1.0, score))  # 夹到 0~1
+
+        return {
+            "polarity": polarity,
+            "score": score,
+            "emotion": data.get("emotion", ""),
+            "mode": "llm",
+        }
+    except Exception:
+        # LLM 调用失败 → fallback 到关键词模式
+        keyword_result = detect_emotion(text)
+        keyword_result["mode"] = "keyword"
+        keyword_result["emotion"] = ""
+        return keyword_result
+
+
+# ============================================================================
 # 回应语气指引
 # ============================================================================
 

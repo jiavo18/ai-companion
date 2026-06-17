@@ -12,7 +12,7 @@ from datetime import datetime
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
-from src.emotion import detect_emotion, get_emotion_response_guide
+from src.emotion import detect_emotion, detect_emotion_llm, get_emotion_response_guide
 from src.memory import store_memory
 from src.feedback import store_feedback, retrieve_feedback, parse_feedback_to_constraints
 from src.proactive import (
@@ -133,17 +133,26 @@ class Companion:
             last_active_file=DEFAULT_LAST_ACTIVE_FILE,
         )
 
-        # —— 步骤2: 情感检测 ——
-        emotion_result = detect_emotion(user_input)
+        # —— 步骤2: 情感检测（支持关键词/LLM 双模式） ——
+        emotion_mode = session_state.get("emotion_mode", "keyword")
+        if emotion_mode == "llm" and llm is not None:
+            emotion_result = detect_emotion_llm(user_input, llm)
+        else:
+            emotion_result = detect_emotion(user_input)
+            emotion_result["mode"] = "keyword"
+            emotion_result["emotion"] = ""
         emotion_guide = get_emotion_response_guide(emotion_result["polarity"])
 
-        # 记录情绪
-        emotion_history = session_state.get("emotion_history", [])
-        emotion_history.append({
+        # 记录情绪（LLM 模式下额外存具体情感名称）
+        emotion_entry = {
             "time": datetime.now().isoformat(),
             "polarity": emotion_result["polarity"],
             "score": emotion_result["score"],
-        })
+        }
+        if emotion_result.get("emotion"):
+            emotion_entry["emotion"] = emotion_result["emotion"]
+        emotion_history = session_state.get("emotion_history", [])
+        emotion_history.append(emotion_entry)
         # 只保留最近 100 条
         if len(emotion_history) > 100:
             emotion_history = emotion_history[-100:]
