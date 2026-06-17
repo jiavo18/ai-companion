@@ -60,6 +60,7 @@ def init_session_state():
     D = {
         "logged_in": False, "current_user": None, "current_session_id": "",
         "messages": [], "emotion_history": [], "api_key_verified": False,
+        "auto_extract_enabled": True,  # 自动记忆提取开关
         "memory_count": 0, "user_api_key": "", "last_proactive_time": {},
         "user_avatar": "👤", "ai_avatar": "🌱", "user_name": "我", "ai_name": "禾苗",
         "companion": None,
@@ -244,6 +245,12 @@ def render_sidebar():
                     n = st.text_input("AI 昵称", value=st.session_state.ai_name, max_chars=10, key="ainame")
                     if n and n != st.session_state.ai_name: st.session_state.ai_name = n; st.rerun()
                 st.caption(f"预览：{st.session_state.user_avatar} {st.session_state.user_name}  ⇄  {st.session_state.ai_avatar} {st.session_state.ai_name}")
+
+            # 自动记忆提取开关
+            st.checkbox("自动记忆提取", value=st.session_state.auto_extract_enabled,
+                        key="auto_extract_toggle",
+                        help="开启后AI会自动从对话中识别并记住你的信息。关闭后仅手动「记住：xxx」指令生效。",
+                        on_change=lambda: setattr(st.session_state, "auto_extract_enabled", st.session_state.auto_extract_toggle))
 
             st.markdown("---")
 

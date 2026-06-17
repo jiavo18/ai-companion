@@ -23,6 +23,7 @@ from src.proactive import (
 from src.prompt_builder import build_system_prompt
 from src.conversation import ConversationManager
 from src.database import DEFAULT_DB_PATH
+from src.memory_extractor import start_auto_extraction
 
 
 class Companion:
@@ -205,6 +206,20 @@ class Companion:
                 )
             except Exception:
                 pass  # 持久化失败不影响主流程
+
+        # —— 步骤11: 自动记忆提取（后台线程，不阻塞） ——
+        auto_extract = session_state.get("auto_extract_enabled", True)
+        if auto_extract and llm is not None:
+            try:
+                start_auto_extraction(
+                    user_message=user_input,
+                    ai_reply=reply,
+                    memory_collection=self.memory_collection,
+                    llm=llm,
+                    on_done=lambda count: None,  # 静默完成
+                )
+            except Exception:
+                pass  # 提取失败不影响主流程
 
         return reply
 
